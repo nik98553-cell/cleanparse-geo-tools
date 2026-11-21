@@ -7,6 +7,9 @@ Imports overseas_v1/github_public_starter/scripts/check_llms_and_robots.py direc
 Run:
     python -B overseas_v1/github_public_starter/benchmarks/run_public_docs_benchmark.py
     python -B overseas_v1/github_public_starter/benchmarks/run_public_docs_benchmark.py --use-system-proxy
+    python -B overseas_v1/github_public_starter/benchmarks/run_public_docs_benchmark.py \
+        --targets-json overseas_v1/github_public_starter/benchmarks/targets_indie_and_ai_web_2026.json \
+        --benchmark-name indie_and_ai_web_2026
 """
 from __future__ import annotations
 
@@ -52,6 +55,71 @@ TARGETS: tuple[tuple[str, str, str], ...] = (
     ("python", "Python 3 Docs", "https://docs.python.org/3/"),
     ("mdn", "MDN Web Docs", "https://developer.mozilla.org/en-US/"),
 )
+
+DEFAULT_BENCHMARK_NAME = "public_docs_geo_2026"
+
+# README titles per benchmark name; the default entry is the committed 12-site wording.
+_BENCHMARK_TITLES = {
+    DEFAULT_BENCHMARK_NAME: "2026 Public Documentation AI Search Visibility Benchmark",
+    "indie_and_ai_web_2026": "2026 Indie SaaS & AI Web Apps AI Search Visibility Benchmark",
+}
+
+_BENCHMARK_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
+_TARGET_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+_HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+# Reserved / non-public TLDs (RFC 2606, 6761, 6762) plus example domains, which are never benchmark targets.
+_NON_PUBLIC_TLDS = frozenset({"local", "localhost", "test", "example", "invalid", "internal", "lan"})
+_NON_PUBLIC_HOSTS = frozenset({"example.com", "example.net", "example.org"})
+
+
+def _check_benchmark_name(name: str) -> None:
+    if not _BENCHMARK_NAME_RE.fullmatch(name):
+        raise ValueError(f"benchmark name must match [a-z0-9][a-z0-9_]{{0,63}}: {name!r}")
+
+
+def _validate_target_url(url: str) -> None:
+    """Accept only canonical https://<public-hostname>/ root URLs (no port, userinfo, path, query or uppercase)."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if url != f"https://{host}/":
+        raise ValueError(f"target URL must be a canonical https://<host>/ root URL: {url!r}")
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2 or not all(_HOST_LABEL_RE.fullmatch(label) for label in labels):
+        raise ValueError(f"invalid RFC 1123 hostname: {host!r}")
+    if labels[-1].isdigit() or labels[-1] in _NON_PUBLIC_TLDS or host in _NON_PUBLIC_HOSTS:
+        raise ValueError(f"non-public or IP-literal hostname: {host!r}")
+
+
+def load_targets_json(path: Path) -> tuple[tuple[str, str, str], ...]:
+    """Read an ordered JSON array of {"slug", "name", "url", "category"} objects into (slug, name, url) tuples.
+
+    Raises ValueError for malformed entries, duplicate slugs or URLs, and any URL that is not a canonical
+    public https root. "category" is required and validated but not returned, so audit rows keep the same schema.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"{path}: top-level JSON value must be an array")
+    targets: list[tuple[str, str, str]] = []
+    seen_slugs: set[str] = set()
+    seen_urls: set[str] = set()
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}[{index}]: each target must be a JSON object")
+        fields: dict[str, str] = {}
+        for key in ("slug", "name", "url", "category"):
+            value = item.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{path}[{index}]: '{key}' must be a non-empty string")
+            fields[key] = value
+        slug, url = fields["slug"], fields["url"]
+        if not _TARGET_SLUG_RE.fullmatch(slug):
+            raise ValueError(f"{path}[{index}]: invalid slug {slug!r}")
+        _validate_target_url(url)
+        if slug in seen_slugs or url in seen_urls:
+            raise ValueError(f"{path}[{index}]: duplicate slug or URL {slug!r}")
+        seen_slugs.add(slug)
+        seen_urls.add(url)
+        targets.append((slug, fields["name"], url))
+    return tuple(targets)
 
 # One monotonic deadline per fetched URL, shared by every redirect hop, the proxy TCP
 # connect, the CONNECT tunnel, TLS, interim 1xx responses, headers and every body read.
@@ -795,6 +863,11 @@ def _fetch_direct(url: str, force_utf8: bool = False) -> dict[str, Any]:
     return clr._fetch_url_details(url, force_utf8=force_utf8)
 
 
+# A page answering a non-browser GET with one of these statuses is treated as "blocked": the runner
+# stops there and sends no further requests (robots.txt, /llms.txt) to that site.
+_STOP_ON_BLOCK_STATUSES = (403, 429)
+
+
 def _robots_error_section(source: str, path: str, message: str) -> dict[str, Any]:
     return {
         "source": source,
@@ -847,6 +920,10 @@ def _run_audit(url: str, fetch: Any) -> dict[str, Any]:
     and /llms.txt is fetched from the SUBMITTED origin. The page result is computed first,
     so a later robots.txt or /llms.txt transport failure never erases the observed page
     status / parsed HTML; it is reported in report["errors"] instead.
+
+    Stop-on-block: when the page itself answers HTTP 403 or 429, no /robots.txt or /llms.txt
+    request is sent to that site at all. When a robots.txt answers HTTP 429, its RFC 9309
+    4xx verdict is kept but /llms.txt on that origin is skipped.
     """
     page_url = clr.validate_public_url(url, resolve=False)
     report: dict[str, Any] = {"tool": "cleanparse-geo-tools", "version": clr.__version__, "url": page_url}
@@ -869,8 +946,16 @@ def _run_audit(url: str, fetch: Any) -> dict[str, Any]:
         html = clr.audit_html(page_body, final_url)
     html["http_status"] = page_status
 
+    if page_status in _STOP_ON_BLOCK_STATUSES:
+        msg = f"page returned HTTP {page_status}; auxiliary fetches skipped per stop-on-block policy"
+        errors.append(msg)
+        report["robots"] = _robots_error_section("", "/", msg)
+        report["llms"] = {"source": "", "valid": False, "http_status": None, "errors": [msg], "warnings": []}
+        return _finish_report(report, html, visited, final_url, errors)
+
     robots_cache: dict[tuple[str, str, int], tuple[str, int, str]] = {}
     hops: list[tuple[str, dict]] = []
+    throttled_origins: set[tuple[str, str, int]] = set()
     robots_url = ""
     hop_path = "/"
     try:
@@ -882,6 +967,8 @@ def _run_audit(url: str, fetch: Any) -> dict[str, Any]:
                 r_det = fetch(robots_url, force_utf8=True)
                 robots_cache[key] = (robots_url, r_det["status"], r_det["text"])
             robots_url, r_status, r_body = robots_cache[key]
+            if r_status == 429:
+                throttled_origins.add(key)
             hop_report = clr._robots_report_for_status(r_status, r_body, hop_path, robots_url)
             hops.append((hop_url, _normalize_hop_robots_report(hop_report)))
         report["robots"] = clr.combine_robots_hops(hops)
@@ -892,6 +979,11 @@ def _run_audit(url: str, fetch: Any) -> dict[str, Any]:
 
     orig = urllib.parse.urlsplit(page_url)
     llms_url = f"{orig.scheme}://{orig.netloc}/llms.txt"
+    if clr._robots_origin(page_url)[0] in throttled_origins:
+        msg = "robots.txt returned HTTP 429; /llms.txt fetch skipped per stop-on-block policy"
+        errors.append(msg)
+        report["llms"] = {"source": llms_url, "valid": False, "http_status": None, "errors": [msg], "warnings": []}
+        return _finish_report(report, html, visited, final_url, errors)
     try:
         ll_det = fetch(llms_url)
         report["llms"] = _llms_section(ll_det["status"], ll_det["text"], llms_url)
@@ -900,6 +992,13 @@ def _run_audit(url: str, fetch: Any) -> dict[str, Any]:
         errors.append(msg)
         report["llms"] = {"source": llms_url, "valid": False, "http_status": None, "errors": [msg], "warnings": []}
 
+    return _finish_report(report, html, visited, final_url, errors)
+
+
+def _finish_report(
+    report: dict[str, Any], html: dict[str, Any], visited: list[str], final_url: str, errors: list[str]
+) -> dict[str, Any]:
+    """Attach the page section, redirect target, collected errors and the checker link."""
     report["html"] = html
     if len(visited) > 1:
         report["final_url"] = final_url
@@ -1148,24 +1247,69 @@ def _write_csv(path: Path, results: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
+def _robots_checked(payload: dict[str, Any]) -> int:
+    """Completed rows whose robots.txt was actually evaluated.
+
+    A stop-on-block page (HTTP 403/429) or a robots.txt fetch failure still counts as a completed request,
+    but leaves `robots_policy` at `error` and every crawler verdict null, so it cannot sit in the
+    denominator of the crawler bullets. An explicit `summary["robots_checked"]` wins; otherwise the
+    count is derived from the result rows, falling back to `completed_requests`.
+    """
+    s = payload["summary"]
+    if isinstance(s.get("robots_checked"), int):
+        return s["robots_checked"]
+    results = payload.get("results")
+    if results:
+        return sum(1 for r in results if r.get("ok") and r.get("robots_policy") != "error")
+    return s["completed_requests"]
+
+
+def _targets_json_arg(name: str) -> str:
+    """`--targets-json` value for the Reproduce snippet: the committed cohort file when it exists, else a placeholder."""
+    cohort = BENCH_DIR / f"targets_{name}.json"
+    return f"benchmarks/{cohort.name}" if cohort.is_file() else "<targets.json>"
+
+
 def _readme_text(payload: dict[str, Any]) -> str:
     s = payload["summary"]
     obs = payload["observed_at_utc"]
+    name = payload.get("benchmark", DEFAULT_BENCHMARK_NAME)
+    n = s["total_targets"]
+    is_default = name == DEFAULT_BENCHMARK_NAME
+    completed = s["completed_requests"]
+    # The committed default README keeps completed_requests as its crawler denominator (byte-for-byte test).
+    robots_den = completed if is_default else _robots_checked(payload)
+    robots_note = (
+        ""
+        if robots_den == completed
+        else f" (robots.txt checked on {robots_den} of {completed} completed requests; "
+        f"{completed - robots_den} hit stop-on-block or a robots.txt fetch error)"
+    )
+    targets_arg = "" if is_default else _targets_json_arg(name)
+    title = _BENCHMARK_TITLES.get(name, f"2026 {name} AI Search Visibility Benchmark")
+    subject = (
+        "public developer documentation & tool homepages"
+        if is_default
+        else "public indie SaaS, AI web app & developer tool homepages"
+    )
+    counterpart = [] if not is_default else [
+        "> Live web page counterpart: <https://cleanparse.com/ai-crawler-visibility-benchmark>",
+        "",
+    ]
     lines = [
-        "# 2026 Public Documentation AI Search Visibility Benchmark",
+        f"# {title}",
         "",
         f"Snapshot captured at `{obs}` using [`scripts/check_llms_and_robots.py`](../scripts/check_llms_and_robots.py) (`v{payload['tool_version']}`).",
         "",
-        "> Live web page counterpart: <https://cleanparse.com/ai-crawler-visibility-benchmark>",
-        "",
+        *counterpart,
         "## Summary of Observed Snapshot",
         "",
-        f"- **Targets tested**: {s['total_targets']} public developer documentation & tool homepages",
+        f"- **Targets tested**: {n} {subject}",
         f"- **HTTP 2xx pages**: {s['http_2xx_pages']} / {s['total_targets']}",
         f"- **HTML pages parsed (excluding 204 / 206)**: {s['html_parsed_pages']} / {s['total_targets']}",
-        f"- **All 3 AI search crawlers allowed (`OAI-SearchBot`, `Claude-SearchBot`, `PerplexityBot`)**: {s['all_search_crawlers_allowed']} / {s['completed_requests']}",
-        f"- **At least one AI training crawler blocked (`GPTBot` / `ClaudeBot`)**: {s['any_training_crawler_blocked']} / {s['completed_requests']}",
-        f"- **Split policy (allow search, block training)**: {s['split_search_allow_training_block']} / {s['completed_requests']}",
+        f"- **All 3 AI search crawlers allowed (`OAI-SearchBot`, `Claude-SearchBot`, `PerplexityBot`)**: {s['all_search_crawlers_allowed']} / {robots_den}{robots_note}",
+        f"- **At least one AI training crawler blocked (`GPTBot` / `ClaudeBot`)**: {s['any_training_crawler_blocked']} / {robots_den}{robots_note}",
+        f"- **Split policy (allow search, block training)**: {s['split_search_allow_training_block']} / {robots_den}{robots_note}",
         f"- **`/llms.txt` HTTP 2xx / strict structural valid**: {s['llms_txt_http_2xx']} / {s['llms_txt_strictly_valid']}",
         f"- **Static HTML `server_rendered` (among 2xx)**: {s['server_rendered_2xx']} / {s['http_2xx_pages']}",
         "",
@@ -1192,6 +1336,12 @@ def _readme_text(payload: dict[str, Any]) -> str:
         "- **HTTP 204 / 206**: an HTTP 204 page counts as 2xx with verdict `no_content` (no HTML body, not parsed); an HTTP 206 partial page counts as 2xx but is not parsed (`fetch_failed`); a `/llms.txt` HTTP 204 (empty body) is not a valid `llms.txt`.",
         "- **`robots.txt` fetch failure**: if `robots.txt` fails after the page was fetched, the observed page HTTP status and HTML fields are kept, `robots_policy` becomes `error` (crawler cells show `ERROR`) and the message is recorded in `error`.",
         "- **`/llms.txt` fetch failure**: if `/llms.txt` fails, the robots policy and crawler verdicts are kept, `llms_http_status` is `null` (table cell `ERR`) and the message is recorded in `error`.",
+        *([] if is_default else [
+            "- **Stop-on-block**: redirects are followed and every hop is checked against its own host's `robots.txt`; "
+            "a `robots.txt` HTTP 404 means allow all (RFC 9309). If the page itself returns HTTP 403 or 429, no "
+            "`robots.txt` or `/llms.txt` request is sent to that site (`robots_policy` `error`, `llms_http_status` "
+            "`null`); if a `robots.txt` returns HTTP 429, `/llms.txt` on that origin is skipped.",
+        ]),
         "- **No `*` group**: when a `robots.txt` has no group matching any AI crawler and no `*` wildcard group, the row notes that RFC 9309 defaults to allow all.",
         "- **Point-in-time snapshot**: Crawler policies, `robots.txt`, and server rendering change over time. Verify any site's current status live via:",
         "",
@@ -1202,7 +1352,8 @@ def _readme_text(payload: dict[str, Any]) -> str:
         "## Reproduce",
         "",
         "```bash",
-        "python3 -B benchmarks/run_public_docs_benchmark.py",
+        *(["python3 -B benchmarks/run_public_docs_benchmark.py"] if is_default else
+          [f"python3 -B benchmarks/run_public_docs_benchmark.py --targets-json {targets_arg} --benchmark-name {name}"]),
         "```",
         "",
         "Add `--use-system-proxy` (routes through local OS proxy; proxy egress DNS is outside local SSRF IP pinning). "
@@ -1210,12 +1361,18 @@ def _readme_text(payload: dict[str, Any]) -> str:
         "is configured, and never falls back to unpinned direct TCP.",
         "",
         "```bash",
-        "python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy",
+        *(["python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy"] if is_default else
+          [f"python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy --targets-json {targets_arg} --benchmark-name {name}"]),
         "```",
         "",
-        "MIT Licensed dataset (`public_docs_geo_2026.json` & `public_docs_geo_2026.csv`). "
-        "The other 11 measured sites are not affiliated with and do not endorse this benchmark "
-        "(CleanParse Studio is our own site).",
+        *([
+            "MIT Licensed dataset (`public_docs_geo_2026.json` & `public_docs_geo_2026.csv`). "
+            "The other 11 measured sites are not affiliated with and do not endorse this benchmark "
+            "(CleanParse Studio is our own site).",
+        ] if is_default else [
+            f"MIT Licensed dataset (`{name}.json` & `{name}.csv`). "
+            f"All {n} measured sites are third-party public sites and are not affiliated with or endorse this benchmark.",
+        ]),
         "",
     ])
     return "\n".join(lines)
@@ -1231,18 +1388,23 @@ def run_benchmark(
     readme_out: Path | None = None,
     use_system_proxy: bool = False,
     require_proxy: bool = True,
+    targets: tuple[tuple[str, str, str], ...] = TARGETS,
+    benchmark_name: str = DEFAULT_BENCHMARK_NAME,
 ) -> dict[str, Any]:
     """Run every target and write JSON, CSV and README.
 
     With use_system_proxy=True the OS proxy is checked FIRST (unless require_proxy=False,
     an internal hook for offline tests that mock the transport): without an explicit HTTP
     proxy, ProxyPreflightError is raised before any target runs or any file is written.
+    `targets` and `benchmark_name` default to the committed 12-site dataset; a non-default
+    name writes `<name>.json`, `<name>.csv` and `README_<name>.md` next to this script.
     """
-    if use_system_proxy and require_proxy and not _has_proxy_for_targets(TARGETS):
+    _check_benchmark_name(benchmark_name)
+    if use_system_proxy and require_proxy and not _has_proxy_for_targets(targets):
         raise ProxyPreflightError(_NO_PROXY_PREFLIGHT_MSG)
-    results = [audit_target(slug, name, url, use_system_proxy=use_system_proxy) for slug, name, url in TARGETS]
+    results = [audit_target(slug, name, url, use_system_proxy=use_system_proxy) for slug, name, url in targets]
     payload: dict[str, Any] = {
-        "benchmark": "public_docs_geo_2026",
+        "benchmark": benchmark_name,
         "tool": "cleanparse-geo-tools",
         "tool_version": clr.__version__,
         "observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1250,9 +1412,10 @@ def run_benchmark(
         "summary": _summarize(results),
         "results": results,
     }
-    json_path = json_out or (BENCH_DIR / "public_docs_geo_2026.json")
-    csv_path = csv_out or (BENCH_DIR / "public_docs_geo_2026.csv")
-    readme_path = readme_out or (BENCH_DIR / "README.md")
+    readme_name = "README.md" if benchmark_name == DEFAULT_BENCHMARK_NAME else f"README_{benchmark_name}.md"
+    json_path = json_out or (BENCH_DIR / f"{benchmark_name}.json")
+    csv_path = csv_out or (BENCH_DIR / f"{benchmark_name}.csv")
+    readme_path = readme_out or (BENCH_DIR / readme_name)
     json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     _write_csv(csv_path, results)
     _write_readme(readme_path, payload)
@@ -1265,6 +1428,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--csv-out", default=None)
     ap.add_argument("--readme-out", default=None)
     ap.add_argument(
+        "--targets-json",
+        default=None,
+        help="Ordered JSON target array (see benchmarks/targets_indie_and_ai_web_2026.json). Default: the 12 built-in sites.",
+    )
+    ap.add_argument(
+        "--benchmark-name",
+        default=None,
+        help=f"Benchmark name used for output filenames. Default: '{DEFAULT_BENCHMARK_NAME}'. Required with --targets-json.",
+    )
+    ap.add_argument(
         "--use-system-proxy",
         action="store_true",
         help=(
@@ -1274,7 +1447,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = ap.parse_args(argv)
-    if args.use_system_proxy and not _has_proxy_for_targets(TARGETS):
+    benchmark_name = args.benchmark_name or DEFAULT_BENCHMARK_NAME
+    try:
+        targets = load_targets_json(Path(args.targets_json)) if args.targets_json else TARGETS
+        _check_benchmark_name(benchmark_name)
+        if args.targets_json and benchmark_name == DEFAULT_BENCHMARK_NAME:
+            raise ValueError(
+                f"--targets-json requires --benchmark-name other than '{DEFAULT_BENCHMARK_NAME}' "
+                "so the committed 12-site dataset is never overwritten"
+            )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.use_system_proxy and not _has_proxy_for_targets(targets):
         print(f"error: {_NO_PROXY_PREFLIGHT_MSG}", file=sys.stderr)
         return 2
     try:
@@ -1283,6 +1468,8 @@ def main(argv: list[str] | None = None) -> int:
             csv_out=Path(args.csv_out) if args.csv_out else None,
             readme_out=Path(args.readme_out) if args.readme_out else None,
             use_system_proxy=args.use_system_proxy,
+            targets=targets,
+            benchmark_name=benchmark_name,
         )
     except ProxyPreflightError as exc:
         print(f"error: {exc}", file=sys.stderr)
