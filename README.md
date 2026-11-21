@@ -11,6 +11,7 @@ A small, zero-dependency toolkit for developers and site owners who want their p
   - flags empty client-side-rendered (CSR) HTML shells that crawlers without JavaScript see as blank pages.
 - `examples/` - clean fixtures for robots/llms checks plus messy sample data for CSV normalization,
   BibTeX deduplication and SSR-vs-CSR comparisons.
+- `benchmarks/` - a reproducible public docs benchmark (runner plus the MIT-licensed JSON / CSV dataset).
 - `tests/` - an offline `unittest` suite (no network calls).
 
 MIT licensed. No install step, no `pip`, no API keys.
@@ -28,6 +29,7 @@ Prefer not to run anything locally? The same checks run in the browser:
 | HTML to Markdown | <https://cleanparse.com/html-to-markdown> |
 | Guide: AI crawlers in robots.txt | <https://cleanparse.com/ai-crawler-robots-txt-guide> |
 | Guide: SPA / JS rendering and GEO | <https://cleanparse.com/spa-js-rendering-geo-guide> |
+| 2026 AI crawler visibility benchmark | <https://cleanparse.com/ai-crawler-visibility-benchmark> |
 
 ### Official tools
 
@@ -126,6 +128,29 @@ empty mount nodes (`root`, `app`, `__next`, `__nuxt`, ...). Verdicts: `server_re
 | `examples/messy_refs.bib` | duplicate citation keys, the same DOI under three keys, mixed field casing and quoting | [BibTeX sanitizer](https://cleanparse.com/bibtex-sanitizer) |
 | `examples/csr_vs_ssr_sample.html` | an SPA shell with no server-rendered text | this script, `--html-file` |
 
+## Public Docs Benchmark (`benchmarks/`)
+
+A dated, point-in-time snapshot of how 12 public documentation and tool homepages (Next.js, React, Astro,
+Vite, Vue.js, Svelte, Nuxt, Docusaurus, Tailwind CSS, Python 3, MDN and our own site) treat AI crawlers.
+
+| File | What it is |
+|---|---|
+| `benchmarks/run_public_docs_benchmark.py` | Runner: one read-only GET per page, robots.txt and `/llms.txt`, evaluated with the same functions as `scripts/check_llms_and_robots.py` |
+| `benchmarks/public_docs_geo_2026.json` | Full dataset: summary counts plus one record per site (crawler verdicts, matched groups, llms.txt stats, HTML verdict) |
+| `benchmarks/public_docs_geo_2026.csv` | The same per-site rows as a flat CSV for spreadsheets |
+| `benchmarks/README.md` | Generated summary and results table for the latest snapshot |
+
+```bash
+python3 -B benchmarks/run_public_docs_benchmark.py
+# Opt-in: route through the OS proxy (for fake-IP DNS networks); every redirect hop is still validated
+python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy
+```
+
+Rerunning overwrites the JSON, CSV and `benchmarks/README.md` with a new snapshot. Blocks (HTTP 403 / 429 /
+challenge pages) are recorded as-is, with no retries or workarounds. Read the write-up at
+<https://cleanparse.com/ai-crawler-visibility-benchmark>. The other 11 measured sites are not affiliated with
+and do not endorse this benchmark (CleanParse Studio is our own site).
+
 ## Safety of live mode
 
 `--url` only fetches public `http(s)` targets. It refuses other schemes, credentials in the URL, non-web
@@ -144,6 +169,8 @@ python3 -B -m unittest discover -s tests -v
 ```
 
 The suite is fully offline: socket lookups are patched to fail if any test tries to use the network.
+It also checks that the committed benchmark JSON and CSV agree with each other and that the benchmark's
+proxy transport refuses unsafe URLs before opening any connection.
 
 ## Contributing
 
