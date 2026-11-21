@@ -1,0 +1,20 @@
+# Example Docs
+
+> Example Docs is a small developer documentation site. This file lists the pages that best explain the product to language models and AI search tools.
+
+Pages are plain HTML rendered on the server; every link below works without JavaScript.
+
+## Guides
+
+- [Quick start](https://example.com/docs/quick-start.html): install and first run in five minutes
+- [Configuration](https://example.com/docs/config.html): every option with defaults
+- [Troubleshooting](https://example.com/docs/troubleshooting.html): common errors and fixes
+
+## Reference
+
+- [CLI reference](https://example.com/docs/cli.html): commands, flags and exit codes
+- [Changelog](https://example.com/changelog.html)
+
+## Optional
+
+- [Blog](https://example.com/blog/): release notes and longer write-ups

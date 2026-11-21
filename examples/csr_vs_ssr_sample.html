@@ -1,1 +1,25 @@
-<!-- init -->
+<!doctype html>
+<!--
+  CSR shell sample: this is what many single-page apps send to a crawler that does not
+  run JavaScript. The visible text is empty; all content arrives later via bundle.js.
+  Compare with the SSR section in the README and run:
+    python3 scripts/check_llms_and_robots.py --html-file examples/csr_vs_ssr_sample.html
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pricing | Example App</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script>
+    window.__INITIAL_CONFIG__ = {"apiBase": "/api", "locale": "en", "features": ["pricing", "faq", "signup"],
+      "theme": {"primary": "#2563eb", "radius": 8}, "experiments": {"newPricingTable": true, "annualToggle": true}};
+  </script>
+</head>
+<body>
+  <noscript>You need to enable JavaScript to run this app.</noscript>
+  <div id="root"><div class="spinner"></div></div>
+  <script src="/assets/vendor.js" defer></script>
+  <script src="/assets/bundle.js" defer></script>
+</body>
+</html>

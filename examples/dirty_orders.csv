@@ -1,0 +1,10 @@
+Order ID , Customer Name,order_date,Amount (USD), Status ,Country
+1001,  Acme Widgets Ltd ,2026-01-05,"1,250.00",shipped,US
+1002,Blue Harbor Co.,01/07/2026,$89.90,Shipped ,us
+1003,"Northwind, Inc.",2026/01/09,  430 ,PENDING,United States
+1003,"Northwind, Inc.",2026/01/09,  430 ,PENDING,United States
+1004,Contoso Trading,9 Jan 2026,"€ 1.020,50",cancelled,DE
+1005,,2026-01-11,0,shipped,
+1006,Fabrikam Labs,2026-01-12,N/A,refunded,GB
+,,,,,
+1007,  Tailspin Toys,2026-01-13,"12,000",Shipped,uk
