@@ -139,11 +139,17 @@ Vite, Vue.js, Svelte, Nuxt, Docusaurus, Tailwind CSS, Python 3, MDN and our own 
 | `benchmarks/public_docs_geo_2026.json` | Full dataset: summary counts plus one record per site (crawler verdicts, matched groups, llms.txt stats, HTML verdict) |
 | `benchmarks/public_docs_geo_2026.csv` | The same per-site rows as a flat CSV for spreadsheets |
 | `benchmarks/README.md` | Generated summary and results table for the latest snapshot |
+| `benchmarks/README_indie_and_ai_web_2026.md` | Expanded 60-site cohort (indie SaaS, AI web apps and dev tools), observed `2026-11-21T12:00:10Z`: summary, results table and methodology |
+| `benchmarks/indie_and_ai_web_2026.csv` | The 60-site cohort as a flat CSV, one row per site |
+| `benchmarks/indie_and_ai_web_2026.json` | The 60-site cohort as JSON: summary counts plus one record per site |
+| `benchmarks/targets_indie_and_ai_web_2026.json` | The 60 target URLs used for the expanded cohort (input to the runner's `--targets-json`) |
 
 ```bash
 python3 -B benchmarks/run_public_docs_benchmark.py
 # Opt-in: route through the OS proxy (for fake-IP DNS networks); every redirect hop is still validated
 python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy
+# 60-site cohort
+python3 -B benchmarks/run_public_docs_benchmark.py --targets-json benchmarks/targets_indie_and_ai_web_2026.json --benchmark-name indie_and_ai_web_2026 --use-system-proxy
 ```
 
 Rerunning overwrites the JSON, CSV and `benchmarks/README.md` with a new snapshot. Blocks (HTTP 403 / 429 /
