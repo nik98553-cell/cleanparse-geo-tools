@@ -3231,15 +3231,15 @@ class BenchmarkDatasetTests(NoNetworkTestCase):
     def test_secondary_robots_and_llms_errors_preserve_observed_status(self):
         page = "https://example.com/"
         table = {
-            page: (403, "", None, "text/html"),
+            page: (500, "", None, "text/html"),
             "https://example.com/robots.txt": self.bench.clr.FetchError("robots boom"),
             "https://example.com/llms.txt": TimeoutError("llms slow"),
         }
         with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
-            row = self.bench.audit_target("f", "Forbidden", page, use_system_proxy=True)
+            row = self.bench.audit_target("f", "ServerError", page, use_system_proxy=True)
         self.assertEqual(set(row), BENCH_RESULT_KEYS)
         self.assertTrue(row["ok"])
-        self.assertEqual(row["http_status"], 403)
+        self.assertEqual(row["http_status"], 500)
         self.assertEqual(row["html_verdict"], "fetch_failed")
         self.assertEqual(row["robots_policy"], "error")
         self.assertIsNone(row["oai_searchbot"])
@@ -3248,6 +3248,112 @@ class BenchmarkDatasetTests(NoNetworkTestCase):
         self.assertIn("llms slow", row["error"])
         s = self.bench._summarize([row])
         self.assertEqual((s["completed_requests"], s["http_2xx_pages"], s["all_search_crawlers_allowed"]), (1, 0, 0))
+
+    def test_page_403_and_429_stop_immediately_without_auxiliary_fetches(self):
+        page = "https://example.com/"
+        for status in (403, 429):
+            for mode, target in (("proxy", "_fetch_via_proxy"), ("direct", "_fetch_direct")):
+                with self.subTest(status=status, mode=mode):
+                    table = {
+                        page: (status, "<html>blocked</html>", None, "text/html"),
+                        "https://example.com/robots.txt": AssertionError("robots.txt must not be fetched"),
+                        "https://example.com/llms.txt": AssertionError("llms.txt must not be fetched"),
+                    }
+                    calls = []
+                    with mock.patch.object(self.bench, target, side_effect=self._fake_fetch(table, calls)):
+                        row = self.bench.audit_target("b", "Blocked", page, use_system_proxy=(mode == "proxy"))
+                    self.assertEqual(calls, [page])
+                    self.assertEqual(set(row), BENCH_RESULT_KEYS)
+                    self.assertTrue(row["ok"])
+                    self.assertEqual(row["http_status"], status)
+                    self.assertEqual(row["html_verdict"], "fetch_failed")
+                    self.assertEqual(row["robots_policy"], "error")
+                    self.assertEqual(row["robots_source"], "")
+                    for bot in ("oai_searchbot", "claude_searchbot", "perplexitybot", "gptbot", "claudebot"):
+                        self.assertIsNone(row[bot], bot)
+                    self.assertIsNone(row["llms_http_status"])
+                    self.assertFalse(row["llms_valid"])
+                    self.assertEqual(row["llms_source"], "")
+                    self.assertIn("auxiliary fetches skipped", row["error"])
+                    self.assertIn(f"HTTP {status}", row["error"])
+                    s = self.bench._summarize([row])
+                    self.assertEqual((s["completed_requests"], s["http_2xx_pages"], s["all_search_crawlers_allowed"]), (1, 0, 0))
+                    self.assertEqual(s["llms_txt_http_2xx"], 0)
+
+    def test_page_403_after_redirect_still_stops_before_any_robots_fetch(self):
+        page = "https://example.com/start"
+        final = "https://www.example.com/blocked"
+        table = {
+            page: (403, "", [page, final], "text/html"),
+            "https://example.com/robots.txt": AssertionError("robots.txt must not be fetched"),
+            "https://www.example.com/robots.txt": AssertionError("robots.txt must not be fetched"),
+            "https://example.com/llms.txt": AssertionError("llms.txt must not be fetched"),
+        }
+        calls = []
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, calls)):
+            row = self.bench.audit_target("r", "Redirected", page, use_system_proxy=True)
+        self.assertEqual(calls, [page])
+        self.assertEqual(row["final_url"], final)
+        self.assertEqual(row["robots_policy"], "error")
+        self.assertIn("stop-on-block", row["error"])
+
+    def test_robots_429_keeps_rfc9309_verdict_but_skips_llms_on_that_origin(self):
+        page = "https://example.com/"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", None, "text/html"),
+            "https://example.com/robots.txt": (429, "", None, "text/plain"),
+            "https://example.com/llms.txt": AssertionError("llms.txt must not be fetched after robots.txt 429"),
+        }
+        calls = []
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, calls)):
+            row = self.bench.audit_target("t", "Throttled", page, use_system_proxy=True)
+        self.assertEqual(calls, [page, "https://example.com/robots.txt"])
+        self.assertEqual((row["http_status"], row["html_verdict"]), (200, "server_rendered"))
+        # The existing RFC 9309 4xx semantics for robots.txt are unchanged (allow all).
+        self.assertEqual(row["oai_searchbot"], True)
+        self.assertNotEqual(row["robots_policy"], "error")
+        self.assertIsNone(row["llms_http_status"])
+        self.assertFalse(row["llms_valid"])
+        self.assertEqual(row["llms_source"], "https://example.com/llms.txt")
+        self.assertIn("robots.txt returned HTTP 429", row["error"])
+
+    def test_robots_429_on_redirect_target_does_not_skip_llms_on_submitted_origin(self):
+        page = "https://example.com/start"
+        final = "https://docs.example.org/final"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", [page, final], "text/html"),
+            "https://example.com/robots.txt": (200, "User-agent: *\nAllow: /\n", None, "text/plain"),
+            "https://docs.example.org/robots.txt": (429, "", None, "text/plain"),
+            "https://example.com/llms.txt": (404, "", None, None),
+        }
+        calls = []
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, calls)):
+            row = self.bench.audit_target("x", "X", page, use_system_proxy=True)
+        self.assertIn("https://example.com/llms.txt", calls)
+        self.assertEqual(row["llms_http_status"], 404)
+        self.assertEqual(row["error"], "")
+
+    def test_non_default_readme_proxy_command_keeps_targets_and_name(self):
+        row = dict(self.payload["results"][0])
+        payload = {
+            "benchmark": "indie_and_ai_web_2026",
+            "summary": self.bench._summarize([row]),
+            "observed_at_utc": "2026-01-01T00:00:00Z",
+            "tool_version": self.bench.clr.__version__,
+            "results": [row],
+        }
+        text = self.bench._readme_text(payload)
+        self.assertIn(
+            "python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy "
+            "--targets-json benchmarks/targets_indie_and_ai_web_2026.json --benchmark-name indie_and_ai_web_2026",
+            text,
+        )
+        self.assertNotIn("python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy\n", text)
+        self.assertIn("**Stop-on-block**", text)
+        default_text = self.bench._readme_text(dict(payload, benchmark=self.bench.DEFAULT_BENCHMARK_NAME))
+        self.assertIn("python3 -B benchmarks/run_public_docs_benchmark.py --use-system-proxy\n", default_text)
+        self.assertNotIn("--targets-json", default_text)
+        self.assertNotIn("**Stop-on-block**", default_text)
 
     def test_cross_origin_redirect_fetches_llms_from_submitted_origin_in_both_modes(self):
         page = "https://example.com/start"
@@ -3402,6 +3508,76 @@ class BenchmarkDatasetTests(NoNetworkTestCase):
             regen = out.read_bytes()
         self.assertEqual(regen, (BENCH_DIR / "README.md").read_bytes())
         self.assertNotIn(b"HTTP None", regen)
+
+    def test_default_readme_ignores_robots_checked_and_stays_byte_identical(self):
+        committed = (BENCH_DIR / "README.md").read_bytes()
+        self.assertEqual(self.bench._readme_text(self.payload).encode("utf-8"), committed)
+        # The default README keeps completed_requests as its crawler denominator even if robots_checked differs.
+        skewed = dict(self.payload, summary=dict(self.payload["summary"], robots_checked=1))
+        self.assertEqual(self.bench._readme_text(skewed).encode("utf-8"), committed)
+        self.assertNotIn(b"robots.txt checked on", committed)
+
+    def _crawler_bullets(self, text):
+        prefixes = (
+            "- **All 3 AI search crawlers allowed",
+            "- **At least one AI training crawler blocked",
+            "- **Split policy (allow search, block training)**",
+        )
+        lines = [ln for ln in text.splitlines() if ln.startswith(prefixes)]
+        self.assertEqual(len(lines), 3, lines)
+        return lines
+
+    def test_non_default_readme_uses_robots_checked_denominator_for_crawler_bullets(self):
+        summary = {
+            "total_targets": 60, "completed_requests": 59, "transport_errors": 1,
+            "robots_checked": 57, "robots_skipped_blocked": 2,
+            "http_2xx_pages": 57, "html_parsed_pages": 57,
+            "all_search_crawlers_allowed": 57, "any_training_crawler_blocked": 0,
+            "split_search_allow_training_block": 0,
+            "llms_txt_http_2xx": 46, "llms_txt_strictly_valid": 38,
+            "server_rendered_2xx": 54, "thin_or_csr_2xx": 3,
+        }
+        payload = {
+            "benchmark": "indie_and_ai_web_2026",
+            "summary": summary,
+            "observed_at_utc": "2026-01-01T00:00:00Z",
+            "tool_version": self.bench.clr.__version__,
+            "results": [],
+        }
+        text = self.bench._readme_text(payload)
+        search, training, split = self._crawler_bullets(text)
+        note = " (robots.txt checked on 57 of 59 completed requests; 2 hit stop-on-block or a robots.txt fetch error)"
+        self.assertTrue(search.endswith(": 57 / 57" + note), search)
+        self.assertTrue(training.endswith(": 0 / 57" + note), training)
+        self.assertTrue(split.endswith(": 0 / 57" + note), split)
+        for line in (search, training, split):
+            self.assertIsNone(re.search(r": \d+ / 59\b", line), line)
+
+        # Reproduce snippets point at the committed cohort file, which exists relative to the starter root.
+        self.assertIn("--targets-json benchmarks/targets_indie_and_ai_web_2026.json --benchmark-name indie_and_ai_web_2026", text)
+        self.assertNotIn("<targets.json>", text)
+        self.assertTrue((BENCH_DIR.parent / "benchmarks" / "targets_indie_and_ai_web_2026.json").is_file())
+
+        # No committed cohort file for this name: keep the placeholder instead of a non-existent path.
+        other = self.bench._readme_text(dict(payload, benchmark="other_cohort_2026"))
+        self.assertFalse((BENCH_DIR / "targets_other_cohort_2026.json").exists())
+        self.assertIn("--targets-json <targets.json> --benchmark-name other_cohort_2026", other)
+        self.assertNotIn("targets_other_cohort_2026.json", other)
+
+        # Equal denominators need no note.
+        full = self.bench._readme_text(dict(payload, summary=dict(summary, robots_checked=59)))
+        self.assertTrue(self._crawler_bullets(full)[0].endswith(": 57 / 59"))
+        self.assertNotIn("robots.txt checked on", full)
+
+    def test_committed_indie_payload_derives_robots_checked_from_stop_on_block_rows(self):
+        payload = json.loads((BENCH_DIR / "indie_and_ai_web_2026.json").read_text(encoding="utf-8"))
+        self.assertNotIn("robots_checked", payload["summary"])
+        blocked = [r for r in payload["results"] if r["ok"] and r["robots_policy"] == "error"]
+        self.assertEqual(payload["summary"]["completed_requests"] - len(blocked), self.bench._robots_checked(payload))
+        search = self._crawler_bullets(self.bench._readme_text(payload))[0]
+        checked = self.bench._robots_checked(payload)
+        self.assertIn(f": {payload['summary']['all_search_crawlers_allowed']} / {checked} (", search)
+        self.assertLessEqual(payload["summary"]["all_search_crawlers_allowed"], checked)
 
     def test_use_system_proxy_preflight_exits_2_without_touching_files(self):
         bench = self.bench
@@ -3599,6 +3775,112 @@ class BenchmarkDatasetTests(NoNetworkTestCase):
             ):
                 with self.subTest(allowed=(scheme, host, port)):
                     self.assertEqual(bench._ensure_proxy_route(scheme, host, port), "http://127.0.0.1:7897")
+
+
+class IndieAiWebCohortTests(NoNetworkTestCase):
+    """Offline checks for the 60-site cohort JSON, load_targets_json validation and run_benchmark(targets=...)."""
+
+    COHORT = BENCH_DIR / "targets_indie_and_ai_web_2026.json"
+    HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bench = _load_benchmark_module()
+        cls.payload = json.loads((BENCH_DIR / "public_docs_geo_2026.json").read_text(encoding="utf-8"))
+
+    def test_cohort_json_has_sixty_unique_public_https_targets(self):
+        raw = json.loads(self.COHORT.read_text(encoding="utf-8"))
+        self.assertEqual(len(raw), 60)
+        for item in raw:
+            self.assertEqual(set(item), {"slug", "name", "url", "category"}, item)
+        self.assertEqual(
+            {item["category"] for item in raw},
+            {"ai_dev", "indie_saas", "dev_infra", "framework_docs", "nocode_forms"},
+        )
+        targets = self.bench.load_targets_json(self.COHORT)
+        self.assertEqual(len(targets), 60)
+        self.assertEqual([t[0] for t in targets], [item["slug"] for item in raw])
+        self.assertEqual(len({t[0] for t in targets}), 60)
+        self.assertEqual(len({t[2] for t in targets}), 60)
+        for slug, name, url in targets:
+            parts = urllib.parse.urlsplit(url)
+            self.assertEqual(parts.scheme, "https", slug)
+            self.assertEqual(url, f"https://{parts.hostname}/", slug)
+            self.assertIsNotNone(self.HOST_RE.fullmatch(parts.hostname), slug)
+            self.assertNotIn(parts.hostname.rsplit(".", 1)[-1], {"local", "localhost", "test", "example", "invalid"}, slug)
+            self.assertTrue(name.strip(), slug)
+
+    def test_load_targets_json_rejects_non_canonical_or_private_urls(self):
+        good = {"slug": "ok", "name": "OK", "url": "https://example-indie.dev/", "category": "indie_saas"}
+        bad_urls = (
+            "http://example-indie.dev/", "https://Example-Indie.dev/", "https://example-indie.dev:8443/",
+            "https://example-indie.dev/docs", "https://user@example-indie.dev/", "https://127.0.0.1/",
+            "https://[::1]/", "https://service.local/", "https://app.test/", "https://example.com/",
+            "https://exa_mple.dev/",
+        )
+        for url in bad_urls:
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "targets.json"
+                p.write_text(json.dumps([dict(good, url=url)]), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.bench.load_targets_json(p)
+
+    def test_load_targets_json_rejects_duplicates_and_bad_slugs(self):
+        good = {"slug": "ok", "name": "OK", "url": "https://example-indie.dev/", "category": "indie_saas"}
+        cases = (
+            [good, dict(good, slug="other")],
+            [good, dict(good)],
+            [dict(good, slug="Bad Slug")],
+            [dict(good, category="")],
+        )
+        for data in cases:
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "targets.json"
+                p.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.bench.load_targets_json(p)
+
+    def test_run_benchmark_runs_cohort_with_mocked_audit_and_writes_custom_names(self):
+        bench = self.bench
+        targets = bench.load_targets_json(self.COHORT)
+        base = dict(self.payload["results"][0])
+
+        def fake_audit(slug, name, url, use_system_proxy=False):
+            return dict(base, slug=slug, name=name, url=url, final_url=url)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            with mock.patch.object(bench, "audit_target", side_effect=fake_audit) as audit:
+                payload = bench.run_benchmark(
+                    json_out=out / "c.json", csv_out=out / "c.csv", readme_out=out / "README_c.md",
+                    targets=targets, benchmark_name="indie_and_ai_web_2026",
+                )
+            self.assertEqual([c.args[0] for c in audit.call_args_list], [t[0] for t in targets])
+            self.assertEqual(payload["benchmark"], "indie_and_ai_web_2026")
+            self.assertEqual(payload["summary"]["total_targets"], 60)
+            written = json.loads((out / "c.json").read_text(encoding="utf-8"))
+            self.assertEqual(written["summary"]["total_targets"], 60)
+            readme = (out / "README_c.md").read_text(encoding="utf-8")
+        self.assertIn("# 2026 Indie SaaS & AI Web Apps AI Search Visibility Benchmark", readme)
+        self.assertIn("- **Targets tested**: 60 public indie SaaS", readme)
+        self.assertIn("All 60 measured sites", readme)
+        self.assertNotIn("11 measured sites", readme)
+        self.assertNotIn("Live web page counterpart", readme)
+
+    def test_run_benchmark_rejects_unsafe_benchmark_name_before_auditing(self):
+        audit = mock.MagicMock(side_effect=AssertionError("no target may run for an unsafe name"))
+        with mock.patch.object(self.bench, "audit_target", audit):
+            for bad in ("../escape", "Upper", "", "a/b"):
+                with self.subTest(name=bad), self.assertRaises(ValueError):
+                    self.bench.run_benchmark(benchmark_name=bad, targets=self.bench.TARGETS[:1])
+        audit.assert_not_called()
+
+    def test_main_refuses_targets_json_that_would_overwrite_committed_dataset(self):
+        err = io.StringIO()
+        with mock.patch.object(self.bench, "audit_target", mock.MagicMock(side_effect=AssertionError)), \
+                redirect_stderr(err):
+            self.assertEqual(self.bench.main(["--targets-json", str(self.COHORT)]), 2)
+        self.assertIn("never overwritten", err.getvalue())
 
 
 if __name__ == "__main__":
