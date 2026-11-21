@@ -5,7 +5,10 @@ socket.getaddrinfo / socket.create_connection are always patched.
 
 Run:  python -B -m unittest discover -s tests -v
 """
+import csv
+import email.message
 import gzip
+import http.client
 import importlib.util
 import inspect
 import io
@@ -20,9 +23,11 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 import zlib
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -2622,6 +2627,978 @@ class ProtocolHardeningTests(FetchTests):
                 code = cl.main(["--html-file", str(hp), "--json"])
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out.getvalue())["html"]["verdict"], "likely_csr_shell")
+
+
+BENCH_DIR = ROOT / "benchmarks"
+BENCH_RESULT_KEYS = {
+    "slug", "name", "url", "final_url", "ok", "error", "http_status", "robots_source", "robots_policy",
+    "oai_searchbot", "claude_searchbot", "perplexitybot", "gptbot", "claudebot", "crawler_groups",
+    "robots_notes", "llms_source", "llms_http_status", "llms_valid", "llms_sections", "llms_total_links",
+    "visible_words", "script_tags", "external_scripts", "data_script_tags", "inline_script_byte_ratio",
+    "empty_mount_nodes", "html_verdict", "title",
+}
+BENCH_CSV_FIELDS = [
+    "slug", "name", "url", "final_url", "ok", "http_status", "robots_policy", "oai_searchbot",
+    "claude_searchbot", "perplexitybot", "gptbot", "claudebot", "llms_http_status", "llms_valid",
+    "llms_sections", "llms_total_links", "visible_words", "script_tags", "external_scripts",
+    "data_script_tags", "inline_script_byte_ratio", "empty_mount_nodes", "html_verdict", "error",
+]
+BENCH_SUMMARY_KEYS = {
+    "total_targets", "completed_requests", "transport_errors", "http_2xx_pages", "html_parsed_pages",
+    "all_search_crawlers_allowed", "any_training_crawler_blocked", "split_search_allow_training_block",
+    "llms_txt_http_2xx", "llms_txt_strictly_valid", "server_rendered_2xx", "thin_or_csr_2xx",
+}
+
+
+def _load_benchmark_module():
+    spec = importlib.util.spec_from_file_location(
+        "run_public_docs_benchmark_offline", BENCH_DIR / "run_public_docs_benchmark.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeProxyResponse:
+    """Minimal http.client.HTTPResponse-like double used by the --use-system-proxy tests.
+
+    read1() mirrors http.client: `length` counts down the bytes still owed by
+    Content-Length and the response closes at EOF or when `length` reaches 0.
+    `headers` may be a dict or a list of (name, value) pairs (repeated headers).
+    """
+
+    def __init__(self, status=200, body=b"", headers=None, length=None, chunked=False):
+        self.status = status
+        self.headers = email.message.Message()
+        pairs = headers.items() if isinstance(headers, dict) else (headers or [])
+        for key, value in pairs:
+            self.headers[key] = value
+        self._buf = io.BytesIO(body)
+        self.length = length
+        self.chunked = chunked
+        self._closed = False
+
+    def read1(self, n=-1):
+        if self._closed:
+            return b""
+        if self.length is not None and (n < 0 or n > self.length):
+            n = self.length
+        data = self._buf.read(n)
+        if not data and n:
+            self._closed = True
+        elif self.length is not None:
+            self.length -= len(data)
+            if not self.length:
+                self._closed = True
+        return data
+
+    read = read1
+
+    def isclosed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+
+class _BytesSocket:
+    """Socket double whose makefile() serves canned bytes (for real http.client parsing)."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def makefile(self, *_a, **_k):
+        return io.BytesIO(self._data)
+
+
+def _parsed_response(raw: bytes):
+    """A real http.client.HTTPResponse parsed from canned bytes (no network)."""
+    resp = http.client.HTTPResponse(_BytesSocket(raw), method="GET")
+    resp.begin()
+    return resp
+
+
+class _ProxyTunnelSocket(FakeSocket):
+    """Proxy TCP socket double: records CONNECT bytes and replays a canned CONNECT reply via recv()."""
+
+    def __init__(self, connect_reply: bytes, response: bytes = b""):
+        super().__init__(response)
+        self._reply = io.BytesIO(connect_reply)
+        self.shut = threading.Event()
+        self.connected_to = None
+
+    def connect(self, sockaddr):
+        self.connected_to = sockaddr
+
+    def recv(self, n):
+        return self._reply.read(n)
+
+    def shutdown(self, _how):
+        self.shut.set()
+
+
+class _StallingProxySocket(_ProxyTunnelSocket):
+    """Proxy socket that never answers CONNECT until the watchdog shuts it down."""
+
+    def __init__(self):
+        super().__init__(b"")
+
+    def recv(self, n):
+        self.shut.wait(5)
+        return b""
+
+
+def _csv_cell(value):
+    """Render a JSON value the way csv.DictWriter writes it."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ";".join(value)
+    return str(value)
+
+
+class BenchmarkDatasetTests(NoNetworkTestCase):
+    """Offline checks for benchmarks/: dataset parity, summary math and the proxy SSRF guard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bench = _load_benchmark_module()
+        cls.payload = json.loads((BENCH_DIR / "public_docs_geo_2026.json").read_text(encoding="utf-8"))
+        with (BENCH_DIR / "public_docs_geo_2026.csv").open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            cls.csv_header = list(reader.fieldnames or [])
+            cls.csv_rows = list(reader)
+
+    def test_json_has_twelve_complete_results_in_target_order(self):
+        results = self.payload["results"]
+        self.assertEqual(self.payload["benchmark"], "public_docs_geo_2026")
+        self.assertEqual(self.payload["tool"], "cleanparse-geo-tools")
+        self.assertRegex(self.payload["observed_at_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(len(results), 12)
+        self.assertEqual(len(self.bench.TARGETS), 12)
+        for (slug, name, url), row in zip(self.bench.TARGETS, results):
+            self.assertEqual(set(row), BENCH_RESULT_KEYS, slug)
+            self.assertEqual((row["slug"], row["name"], row["url"]), (slug, name, url))
+            self.assertEqual(set(row["crawler_groups"]), {"OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "GPTBot", "ClaudeBot"})
+        self.assertEqual(len({r["slug"] for r in results}), 12)
+
+    def test_summary_matches_per_site_rows(self):
+        summary = self.payload["summary"]
+        self.assertEqual(set(summary), BENCH_SUMMARY_KEYS)
+        self.assertEqual(self.bench._summarize(self.payload["results"]), summary)
+        self.assertEqual(summary["total_targets"], 12)
+        self.assertEqual(summary["completed_requests"] + summary["transport_errors"], 12)
+
+    def test_csv_matches_json_row_for_row(self):
+        self.assertEqual(self.csv_header, BENCH_CSV_FIELDS)
+        self.assertEqual(len(self.csv_rows), 12)
+        for row, rec in zip(self.csv_rows, self.payload["results"]):
+            for key in BENCH_CSV_FIELDS:
+                self.assertEqual(row[key], _csv_cell(rec[key]), f"{rec['slug']}.{key}")
+
+    def test_write_csv_reproduces_committed_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "regen.csv"
+            self.bench._write_csv(out, self.payload["results"])
+            with out.open(encoding="utf-8", newline="") as fh:
+                regen = list(csv.DictReader(fh))
+        self.assertEqual(regen, self.csv_rows)
+
+    def test_summarize_counts_synthetic_edge_cases(self):
+        base = dict(self.payload["results"][0])
+        blocked = dict(base, slug="blocked", gptbot=False, robots_policy="search_allowed_training_blocked")
+        csr = dict(base, slug="csr", html_verdict="likely_csr_shell", llms_http_status=404, llms_valid=False)
+        no_llms_valid = dict(base, slug="lint", llms_valid=False)
+        forbidden = dict(base, slug="forbidden", http_status=403, html_verdict="fetch_failed")
+        error = dict(base, slug="error", ok=False, http_status=None, oai_searchbot=None)
+        s = self.bench._summarize([base, blocked, csr, no_llms_valid, forbidden, error])
+        self.assertEqual(s["total_targets"], 6)
+        self.assertEqual(s["completed_requests"], 5)
+        self.assertEqual(s["transport_errors"], 1)
+        self.assertEqual(s["http_2xx_pages"], 4)
+        self.assertEqual(s["html_parsed_pages"], 4)
+        self.assertEqual(s["all_search_crawlers_allowed"], 5)
+        self.assertEqual(s["any_training_crawler_blocked"], 1)
+        self.assertEqual(s["split_search_allow_training_block"], 1)
+        self.assertEqual(s["llms_txt_http_2xx"], 4)
+        self.assertEqual(s["llms_txt_strictly_valid"], 3)
+        self.assertEqual(s["server_rendered_2xx"], 3)
+        self.assertEqual(s["thin_or_csr_2xx"], 1)
+
+    PROXIES = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+
+    @staticmethod
+    def _must_not_open():
+        return mock.MagicMock(side_effect=AssertionError("proxy connection must not be opened"))
+
+    def _proxy_env(self, proxies=None, bypass=False):
+        """Patch the OS proxy map and bypass list (returns a context manager stack)."""
+        active = self.PROXIES if proxies is None else proxies
+        stack = ExitStack()
+        stack.enter_context(
+            mock.patch.multiple(
+                urllib.request,
+                getproxies=mock.MagicMock(return_value=active),
+                getproxies_environment=mock.MagicMock(return_value=active),
+                proxy_bypass=mock.MagicMock(return_value=bypass),
+            )
+        )
+        stack.enter_context(mock.patch.object(self.bench, "_read_winreg_proxy_override", return_value=None))
+        return stack
+
+    def test_fetch_via_proxy_rejects_unsafe_urls_without_opening_connections(self):
+        opener = self._must_not_open()
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            for bad in ("http://127.0.0.1/", "file:///etc/passwd", "http://user:pass@example.com/"):
+                with self.subTest(url=bad):
+                    with self.assertRaises(self.bench.clr.UnsafeURLError):
+                        self.bench._fetch_via_proxy(bad)
+                    with self.assertRaises(self.bench.clr.UnsafeURLError):
+                        self.bench._run_via_proxy(bad)
+        opener.assert_not_called()
+
+    def test_canonical_request_rejects_backslash_and_bad_ascii_labels(self):
+        unsafe = self.bench.clr.UnsafeURLError
+        opener = self._must_not_open()
+        bad_urls = (
+            "https://exa\\mple.com/",
+            "https://example.com\\.evil.org/",
+            "https://exa!mple.com/",
+            "https://exa$mple.com/",
+            "https://exa*mple.com/",
+            "https://exa%6dple.com/",
+            "https://exa\tmple.com/",
+        )
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            for bad in bad_urls:
+                with self.subTest(url=bad):
+                    with self.assertRaises(unsafe):
+                        self.bench._canonical_request(bad)
+                    with self.assertRaises(unsafe):
+                        self.bench._fetch_via_proxy(bad)
+        opener.assert_not_called()
+        self.assertEqual(
+            self.bench._canonical_request("https://EXAMPLE.com:443/catalog?#frag")[1:],
+            ("https://example.com/catalog?", "https", "example.com", 443, "/catalog?"),
+        )
+        self.assertEqual(
+            self.bench._canonical_request("https://bücher.example/a b")[1:4],
+            ("https://xn--bcher-kva.example/a%20b", "https", "xn--bcher-kva.example"),
+        )
+
+    def test_proxy_hostport_requires_explicit_http_proxy_url(self):
+        hp = self.bench._proxy_hostport
+        unsafe = self.bench.clr.UnsafeURLError
+        self.assertEqual(hp("http://127.0.0.1:7890"), ("127.0.0.1", 7890))
+        self.assertEqual(hp("http://[::1]:7890/"), ("::1", 7890))
+        self.assertEqual(hp("http://proxy.example:3128"), ("proxy.example", 3128))
+        for bad in (None, "", "socks5://127.0.0.1:1080", "socks://127.0.0.1:1080", "https://127.0.0.1:7890",
+                    "127.0.0.1:7890", "http://127.0.0.1", "http://user:pw@127.0.0.1:7890",
+                    "http://127.0.0.1:7890/path", "http://[127.0.0.1]:7890", "http://127.0.0.1:0"):
+            with self.subTest(proxy=bad):
+                with self.assertRaises(unsafe):
+                    hp(bad)
+        for proxies, expected in (({}, False), ({"https": "socks5://127.0.0.1:1080"}, False),
+                                  ({"https": "https://127.0.0.1:7890"}, False),
+                                  ({"http": "http://127.0.0.1:7890"}, False),
+                                  ({"https": "http://127.0.0.1:7890"}, True), (self.PROXIES, True)):
+            with self.subTest(proxies=proxies), self._proxy_env(proxies):
+                self.assertIs(self.bench._has_proxy_for_targets(), expected)
+        with self._proxy_env({"http": "http://127.0.0.1:7890"}):
+            self.assertTrue(self.bench._has_proxy_for_targets((("p", "P", "http://example.com/"),)))
+            self.assertFalse(self.bench._has_proxy_for_targets((("p", "P", "http://example.com/"),
+                                                                ("s", "S", "https://example.com/"))))
+
+    def test_ensure_proxy_route_rejects_missing_invalid_or_bypassed_proxy(self):
+        route = self.bench._ensure_proxy_route
+        unsafe = self.bench.clr.UnsafeURLError
+        for proxies in ({}, {"https": "socks5://127.0.0.1:1080"}, {"https": "https://127.0.0.1:7890"},
+                        {"https": "http://127.0.0.1"}, {"https": ""}, {"http": "http://127.0.0.1:7890"}):
+            with self.subTest(proxies=proxies), self._proxy_env(proxies):
+                with self.assertRaises(unsafe) as ctx:
+                    route("https", "example.com", 443)
+                self.assertIn("No active HTTP/HTTPS proxy", str(ctx.exception))
+        with self._proxy_env(bypass=True):
+            with self.assertRaises(unsafe):
+                route("https", "example.com", 443)
+        with self._proxy_env():
+            self.assertEqual(route("https", "example.com", 443), self.PROXIES["https"])
+            self.assertEqual([c.args[0] for c in urllib.request.proxy_bypass.call_args_list],
+                             ["example.com", "example.com:443"])
+
+    def test_ensure_proxy_route_honours_port_specific_no_proxy(self):
+        route = self.bench._ensure_proxy_route
+        unsafe = self.bench.clr.UnsafeURLError
+        opener = self._must_not_open()
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            urllib.request.proxy_bypass.side_effect = lambda host: host == "example.com:8443"
+            with self.assertRaises(unsafe):
+                route("https", "example.com", 8443)
+            with self.assertRaises(unsafe):
+                self.bench._fetch_via_proxy("https://example.com:8443/docs")
+            self.assertEqual(route("https", "example.com", 443), self.PROXIES["https"])
+            seen = [c.args[0] for c in urllib.request.proxy_bypass.call_args_list]
+        self.assertIn("example.com:8443", seen)
+        opener.assert_not_called()
+
+    def test_fetch_via_proxy_never_opens_without_proxy_route(self):
+        opener = self._must_not_open()
+        with self._proxy_env({}), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            with self.assertRaises(self.bench.clr.UnsafeURLError):
+                self.bench._fetch_via_proxy("https://example.com/")
+            row = self.bench.audit_target("x", "X", "https://example.com/", use_system_proxy=True)
+        opener.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertIn("No active HTTP/HTTPS proxy", row["error"])
+
+    def test_fetch_via_proxy_sends_canonical_requests_only_through_proxy(self):
+        ok = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+        opened = []
+
+        def fake_open(scheme, host, port, proxy_url, remaining_fn, watchdog):
+            self.assertEqual(proxy_url, self.PROXIES[scheme])
+            self.assertTrue(0 < remaining_fn() <= self.bench.PROXY_FETCH_DEADLINE)
+            self.assertIsInstance(watchdog, self.bench.clr._Watchdog)
+            sock = FakeSocket(ok)
+            opened.append((scheme, host, port, sock))
+            return sock
+
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", side_effect=fake_open):
+            det = self.bench._fetch_via_proxy("https://EXAMPLE.com:443/catalog?#frag")
+            self.bench._fetch_via_proxy("https://bücher.example/a b")
+            self.bench._fetch_via_proxy("http://example.com:8080/x?q=1")
+        self.assertEqual((det["status"], det["text"], det["content_type"]), (200, "ok", "text/plain"))
+        self.assertEqual([o[:3] for o in opened], [("https", "example.com", 443),
+                                                   ("https", "xn--bcher-kva.example", 443),
+                                                   ("http", "example.com", 8080)])
+        tls_get, idn_get, plain_get = (o[3].sent for o in opened)
+        # Origin-form target inside the CONNECT tunnel, absolute-form for plain http via the proxy.
+        self.assertTrue(tls_get.startswith(b"GET /catalog? HTTP/1.1\r\n"))
+        self.assertIn(b"\r\nHost: example.com\r\n", tls_get)
+        self.assertIn(b"\r\nUser-Agent: " + self.bench.clr.USER_AGENT.encode("ascii") + b"\r\n", tls_get)
+        self.assertIn(b"\r\nAccept: */*\r\n", tls_get)
+        self.assertIn(b"\r\nAccept-Encoding: gzip, deflate, identity\r\n", tls_get)
+        self.assertIn(b"\r\nConnection: close\r\n", tls_get)
+        self.assertTrue(idn_get.startswith(b"GET /a%20b HTTP/1.1\r\n"))
+        self.assertIn(b"\r\nHost: xn--bcher-kva.example\r\n", idn_get)
+        self.assertTrue(plain_get.startswith(b"GET http://example.com:8080/x?q=1 HTTP/1.1\r\n"))
+        self.assertIn(b"\r\nHost: example.com:8080\r\n", plain_get)
+        self.assertTrue(all(o[3].closed for o in opened))
+
+    def test_fetch_via_proxy_validates_every_redirect_hop(self):
+        first = FakeSocket(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/admin\r\nContent-Length: 0\r\n\r\n")
+        opened = []
+
+        def fake_open(scheme, host, port, *_rest):
+            opened.append((scheme, host, port))
+            return first
+
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", side_effect=fake_open):
+            with self.assertRaises(self.bench.clr.UnsafeURLError):
+                self.bench._fetch_via_proxy("https://example.com/start")
+        self.assertEqual(opened, [("https", "example.com", 443)])
+        self.assertTrue(first.sent.startswith(b"GET /start HTTP/1.1\r\n"))
+
+    def test_fetch_via_proxy_expired_deadline_never_opens(self):
+        opener = self._must_not_open()
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            with self.assertRaises(TimeoutError):
+                self.bench._fetch_via_proxy("https://example.com/", deadline=self.bench.clr._now() - 1)
+        opener.assert_not_called()
+
+    def test_open_proxy_connection_connect_tunnel_tls_and_plain_http(self):
+        clr = self.bench.clr
+        dog = clr._Watchdog(30)
+        dog.start()
+        self.addCleanup(dog.cancel)
+        proxy = self.PROXIES["https"]
+
+        raw = _ProxyTunnelSocket(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n")
+        tls = mock.MagicMock()
+        ctx = mock.MagicMock()
+        ctx.wrap_socket.return_value = tls
+        make_socket = mock.MagicMock(return_value=raw)
+        with mock.patch.object(socket, "socket", make_socket), \
+                mock.patch.object(self.bench.ssl, "create_default_context", return_value=ctx):
+            out = self.bench._open_proxy_connection("https", "example.com", 8443, proxy, lambda: 5.0, dog)
+        self.assertIs(out, tls)
+        make_socket.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        self.assertEqual(raw.connected_to, ("127.0.0.1", 7890))
+        self.assertEqual(raw.timeouts[0], 5.0)
+        self.assertEqual(raw.sent, b"CONNECT example.com:8443 HTTP/1.1\r\nHost: example.com:8443\r\n\r\n")
+        ctx.wrap_socket.assert_called_once_with(raw, server_hostname="example.com", do_handshake_on_connect=False)
+        tls.settimeout.assert_called_with(5.0)
+        tls.do_handshake.assert_called_once_with()
+
+        denied = _ProxyTunnelSocket(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+        no_tls = mock.MagicMock(side_effect=AssertionError("TLS must not start after a failed CONNECT"))
+        with mock.patch.object(socket, "socket", return_value=denied), \
+                mock.patch.object(self.bench.ssl, "create_default_context", no_tls):
+            with self.assertRaises(clr.FetchError):
+                self.bench._open_proxy_connection("https", "2606:4700::1111", 443, proxy, lambda: 5.0, dog)
+        self.assertEqual(denied.sent,
+                         b"CONNECT [2606:4700::1111]:443 HTTP/1.1\r\nHost: [2606:4700::1111]:443\r\n\r\n")
+        self.assertTrue(denied.closed)
+
+        plain = _ProxyTunnelSocket(b"")
+        with mock.patch.object(socket, "socket", return_value=plain):
+            self.assertIs(self.bench._open_proxy_connection("http", "example.com", 80, proxy, lambda: 5.0, dog), plain)
+        self.assertEqual(plain.sent, b"")
+
+        with self.assertRaises(clr.UnsafeURLError):  # never reaches DNS / socket creation
+            self.bench._open_proxy_connection("https", "example.com", 443, "socks5://127.0.0.1:1080", lambda: 5.0, dog)
+
+    def test_open_proxy_connection_bounds_proxy_dns_and_tries_every_address(self):
+        clr = self.bench.clr
+        dog = clr._Watchdog(30)
+        dog.start()
+        self.addCleanup(dog.cancel)
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("2001:db8::7", 3128, 0, 0)),
+                 (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.0.2.7", 3128))]
+        refused = _ProxyTunnelSocket(b"")
+        refused.connect = mock.MagicMock(side_effect=ConnectionRefusedError("refused"))
+        good = _ProxyTunnelSocket(b"")
+        attached = []
+        real_attach = dog.attach
+        resolve = mock.MagicMock(return_value=infos)
+        with mock.patch.object(clr, "_resolve_host", resolve), \
+                mock.patch.object(socket, "socket", side_effect=[refused, good]) as make_socket, \
+                mock.patch.object(dog, "attach", side_effect=lambda s: (attached.append(s), real_attach(s))):
+            out = self.bench._open_proxy_connection("http", "example.com", 80, "http://proxy.example:3128",
+                                                    lambda: 4.0, dog)
+        self.assertIs(out, good)
+        resolve.assert_called_once_with("proxy.example", 3128, 4.0)
+        self.assertEqual([c.args for c in make_socket.call_args_list],
+                         [(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP),
+                          (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)])
+        self.assertEqual(attached[:2], [refused, good], "each attempt is attached BEFORE connect()")
+        self.assertTrue(refused.closed)
+        self.assertEqual(good.connected_to, ("192.0.2.7", 3128))
+
+        last = _ProxyTunnelSocket(b"")
+        last.connect = mock.MagicMock(side_effect=ConnectionRefusedError("refused"))
+        with mock.patch.object(clr, "_resolve_host", return_value=infos[1:]), \
+                mock.patch.object(socket, "socket", return_value=last):
+            with self.assertRaises(ConnectionRefusedError):
+                self.bench._open_proxy_connection("http", "example.com", 80, "http://proxy.example:3128",
+                                                  lambda: 4.0, dog)
+        self.assertTrue(last.closed)
+
+        slow_dns = mock.MagicMock(side_effect=TimeoutError("DNS lookup for proxy.example exceeded 0.1s."))
+        with mock.patch.object(clr, "_resolve_host", slow_dns), \
+                mock.patch.object(socket, "socket", side_effect=AssertionError("no socket after DNS timeout")):
+            with self.assertRaises(TimeoutError):
+                self.bench._open_proxy_connection("http", "example.com", 80, "http://proxy.example:3128",
+                                                  lambda: 0.1, dog)
+
+    def test_watchdog_deadline_aborts_stalled_connect_tunnel(self):
+        clr = self.bench.clr
+        stalled = _StallingProxySocket()
+        self.addCleanup(stalled.shut.set)
+        dog = clr._Watchdog(0.2)
+        with mock.patch.object(socket, "socket", return_value=stalled):
+            dog.start()
+            t0 = time.monotonic()
+            try:
+                with self.assertRaises(TimeoutError):
+                    # remaining_fn alone would allow 30 s: only the watchdog can end this early.
+                    self.bench._open_proxy_connection("https", "example.com", 443, self.PROXIES["https"],
+                                                      lambda: 30.0, dog)
+            finally:
+                dog.cancel()
+        self.assertLess(time.monotonic() - t0, 4)
+        self.assertTrue(dog.fired.is_set())
+        self.assertTrue(stalled.shut.is_set(), "watchdog must shut the proxy socket down")
+        self.assertTrue(stalled.closed)
+
+    def test_watchdog_deadline_aborts_stalled_response_headers(self):
+        stalled = StallingSocket()
+        self.addCleanup(stalled.released.set)
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", return_value=stalled):
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                self.bench._fetch_via_proxy("https://example.com/", deadline=self.bench.clr._now() + 0.3)
+        self.assertLess(time.monotonic() - t0, 4)
+        self.assertTrue(stalled.released.is_set(), "watchdog must shut the stalled socket down")
+        self.assertTrue(stalled.sent.startswith(b"GET / HTTP/1.1\r\n"))
+
+    def test_read_bounded_response_rejects_te_with_content_length_and_multiple_te(self):
+        fetch_error = self.bench.clr.FetchError
+        read = self.bench._read_bounded_response
+        url = "https://example.com/"
+        both = _parsed_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+                                b"5\r\nhello\r\n0\r\n\r\n")
+        with self.assertRaises(fetch_error) as ctx:
+            read(both, url, False)
+        self.assertIn("both Transfer-Encoding and Content-Length", str(ctx.exception))
+        fake_both = _FakeProxyResponse(200, b"hello", [("Transfer-Encoding", "identity"), ("Content-Length", "5")],
+                                       length=5)
+        with self.assertRaises(fetch_error):
+            read(fake_both, url, False)
+        dup = _parsed_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+                               b"5\r\nhello\r\n0\r\n\r\n")
+        with self.assertRaises(fetch_error) as ctx:
+            read(dup, url, False)
+        self.assertIn("Ambiguous Transfer-Encoding", str(ctx.exception))
+        layered = _parsed_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n"
+                                   b"5\r\nhello\r\n0\r\n\r\n")
+        with self.assertRaises(fetch_error):
+            read(layered, url, False)
+        ok = _parsed_response(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              b"5\r\nhello\r\n0\r\n\r\n")
+        self.assertEqual(read(ok, url, False), (200, "hello", "text/plain"))
+
+    def test_read_bounded_response_truncated_chunked_and_short_content_length(self):
+        fetch_error = self.bench.clr.FetchError
+        read = self.bench._read_bounded_response
+        url = "https://example.com/"
+        for raw in (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nhel"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(fetch_error) as ctx:
+                    read(_parsed_response(raw), url, False)
+                self.assertIn("truncated chunked body", str(ctx.exception))
+        with self.assertRaises(fetch_error) as ctx:
+            read(_parsed_response(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nabc"), url, False)
+        self.assertIn("Incomplete HTTP response body", str(ctx.exception))
+        exact = _parsed_response(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello world!")
+        self.assertEqual(read(exact, url, False)[:2], (200, "hello world!"))
+
+    def test_read_bounded_response_truncated_content_length_raises(self):
+        resp = _FakeProxyResponse(200, b"abc", {"Content-Type": "text/html", "Content-Length": "12"}, length=12)
+        with self.assertRaises(self.bench.clr.FetchError) as ctx:
+            self.bench._read_bounded_response(resp, "https://example.com/", False)
+        self.assertIn("Incomplete HTTP response body", str(ctx.exception))
+        full = _FakeProxyResponse(200, b"hello world!", {"Content-Length": "12"}, length=12)
+        status, text, _mt = self.bench._read_bounded_response(full, "https://example.com/", False)
+        self.assertEqual((status, text), (200, "hello world!"))
+        unenforced = _FakeProxyResponse(200, b"abc", {"Content-Length": "12"}, length=None)
+        with self.assertRaises(self.bench.clr.FetchError):
+            self.bench._read_bounded_response(unenforced, "https://example.com/", False)
+        bad_te = _FakeProxyResponse(200, b"abc", {"Transfer-Encoding": "gzip, chunked"})
+        with self.assertRaises(self.bench.clr.FetchError):
+            self.bench._read_bounded_response(bad_te, "https://example.com/", False)
+        expired = _FakeProxyResponse(200, b"abc", {})
+        with self.assertRaises(TimeoutError):
+            self.bench._read_bounded_response(expired, "https://example.com/", False,
+                                              deadline=self.bench.clr._now() - 1)
+
+    def _fake_fetch(self, table, calls):
+        def fake(url, force_utf8=False, deadline=None):
+            calls.append(url)
+            value = table[url]
+            if isinstance(value, BaseException):
+                raise value
+            status, text, visited, ctype = value
+            return {"status": status, "text": text, "visited": list(visited or [url]), "content_type": ctype}
+        return fake
+
+    def test_llms_204_and_page_206_status_preserved(self):
+        page = "https://example.com/docs"
+        table = {
+            page: (206, "<p>partial</p>", None, "text/html"),
+            "https://example.com/robots.txt": (200, "User-agent: *\nAllow: /\n", None, "text/plain"),
+            "https://example.com/llms.txt": (204, "", None, None),
+        }
+        calls = []
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, calls)):
+            row = self.bench.audit_target("p", "Partial", page, use_system_proxy=True)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["error"], "")
+        self.assertEqual(row["http_status"], 206)
+        self.assertEqual(row["html_verdict"], "fetch_failed")
+        self.assertEqual(row["llms_http_status"], 204)
+        self.assertFalse(row["llms_valid"])
+        s = self.bench._summarize([row])
+        self.assertEqual(s["http_2xx_pages"], 1)
+        self.assertEqual(s["html_parsed_pages"], 0)
+        self.assertEqual(s["server_rendered_2xx"], 0)
+
+    def test_llms_200_records_http_status(self):
+        page = "https://example.com/"
+        llms = "# Example\n\n> Summary.\n\n## Docs\n\n- [Guide](https://example.com/guide): Guide.\n"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", None, "text/html"),
+            "https://example.com/robots.txt": (404, "", None, None),
+            "https://example.com/llms.txt": (200, llms, None, "text/plain"),
+        }
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = self.bench.audit_target("e", "Example", page, use_system_proxy=True)
+        self.assertEqual(row["llms_http_status"], 200)
+        self.assertEqual(row["html_verdict"], "server_rendered")
+        self.assertEqual(self.bench._summarize([row])["html_parsed_pages"], 1)
+
+    def test_secondary_robots_and_llms_errors_preserve_observed_status(self):
+        page = "https://example.com/"
+        table = {
+            page: (403, "", None, "text/html"),
+            "https://example.com/robots.txt": self.bench.clr.FetchError("robots boom"),
+            "https://example.com/llms.txt": TimeoutError("llms slow"),
+        }
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = self.bench.audit_target("f", "Forbidden", page, use_system_proxy=True)
+        self.assertEqual(set(row), BENCH_RESULT_KEYS)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["http_status"], 403)
+        self.assertEqual(row["html_verdict"], "fetch_failed")
+        self.assertEqual(row["robots_policy"], "error")
+        self.assertIsNone(row["oai_searchbot"])
+        self.assertIsNone(row["llms_http_status"])
+        self.assertIn("robots boom", row["error"])
+        self.assertIn("llms slow", row["error"])
+        s = self.bench._summarize([row])
+        self.assertEqual((s["completed_requests"], s["http_2xx_pages"], s["all_search_crawlers_allowed"]), (1, 0, 0))
+
+    def test_cross_origin_redirect_fetches_llms_from_submitted_origin_in_both_modes(self):
+        page = "https://example.com/start"
+        final = "https://docs.example.org/final"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", [page, final], "text/html"),
+            "https://example.com/robots.txt": (200, "User-agent: *\nAllow: /\n", None, "text/plain"),
+            "https://docs.example.org/robots.txt": (200, "User-agent: *\nAllow: /\n", None, "text/plain"),
+            "https://example.com/llms.txt": (404, "", None, None),
+        }
+        rows = {}
+        for mode, target in (("proxy", "_fetch_via_proxy"), ("direct", "_fetch_direct")):
+            calls = []
+            with mock.patch.object(self.bench, target, side_effect=self._fake_fetch(table, calls)):
+                rows[mode] = self.bench.audit_target("x", "X", page, use_system_proxy=(mode == "proxy"))
+            with self.subTest(mode=mode):
+                self.assertIn("https://example.com/llms.txt", calls)
+                self.assertNotIn("https://docs.example.org/llms.txt", calls)
+                self.assertIn("https://docs.example.org/robots.txt", calls)
+        self.assertEqual(rows["proxy"], rows["direct"])
+        self.assertEqual(rows["proxy"]["llms_source"], "https://example.com/llms.txt")
+        self.assertEqual(rows["proxy"]["final_url"], final)
+        self.assertEqual(rows["proxy"]["llms_http_status"], 404)
+
+    def test_audit_target_reports_guard_rejection_as_error_row(self):
+        opener = self._must_not_open()
+        with self._proxy_env(), mock.patch.object(self.bench, "_open_proxy_connection", opener):
+            row = self.bench.audit_target("loop", "Loopback", "http://127.0.0.1/", use_system_proxy=True)
+        opener.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["html_verdict"], "fetch_error")
+        self.assertEqual(set(row), BENCH_RESULT_KEYS)
+        self.assertTrue(row["error"])
+
+    def test_page_204_is_no_content_counted_as_2xx_but_not_parsed(self):
+        page = "https://example.com/empty"
+        table = {
+            page: (204, "", None, None),
+            "https://example.com/robots.txt": (200, "User-agent: *\nAllow: /\n", None, "text/plain"),
+            "https://example.com/llms.txt": (404, "", None, None),
+        }
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = self.bench.audit_target("n", "NoContent", page, use_system_proxy=True)
+        self.assertEqual(set(row), BENCH_RESULT_KEYS)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["http_status"], 204)
+        self.assertEqual(row["html_verdict"], "no_content")
+        self.assertEqual((row["visible_words"], row["script_tags"], row["external_scripts"]), (0, 0, 0))
+        self.assertEqual((row["data_script_tags"], row["inline_script_byte_ratio"]), (0, 0.0))
+        self.assertEqual((row["empty_mount_nodes"], row["title"]), ([], ""))
+        section = self.bench._html_no_content(page)
+        self.assertEqual(section["verdict"], "no_content")
+        self.assertEqual(section["http_status"], 204)
+        self.assertEqual(section["advice"], "Page returned HTTP 204 No Content (no HTML body).")
+        self.assertEqual(section["text_preview"], "")
+        s = self.bench._summarize([row])
+        self.assertEqual(s["http_2xx_pages"], 1)
+        self.assertEqual(s["html_parsed_pages"], 0)
+        self.assertEqual(s["server_rendered_2xx"], 0)
+        self.assertEqual(s["thin_or_csr_2xx"], 0)
+
+    def test_llms_failure_preserves_robots_policy_and_renders_err(self):
+        page = "https://example.com/"
+        robots = "User-agent: GPTBot\nDisallow: /\n\nUser-agent: ClaudeBot\nDisallow: /\n"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", None, "text/html"),
+            "https://example.com/robots.txt": (200, robots, None, "text/plain"),
+            "https://example.com/llms.txt": self.bench.clr.FetchError("llms down"),
+        }
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = self.bench.audit_target("e", "Example", page, use_system_proxy=True)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["http_status"], 200)
+        self.assertEqual(row["html_verdict"], "server_rendered")
+        self.assertEqual(row["robots_policy"], "search_allowed_training_blocked")
+        self.assertEqual((row["oai_searchbot"], row["gptbot"], row["claudebot"]), (True, False, False))
+        self.assertIsNone(row["llms_http_status"])
+        self.assertIn("llms down", row["error"])
+        payload = {
+            "summary": self.bench._summarize([row]),
+            "observed_at_utc": "2026-01-01T00:00:00Z",
+            "tool_version": self.bench.clr.__version__,
+            "results": [row],
+        }
+        text = self.bench._readme_text(payload)
+        self.assertNotIn("HTTP None", text)
+        line = next(ln for ln in text.splitlines() if ln.startswith("| [Example]"))
+        self.assertIn("| ERR |", line)
+        self.assertIn("| BLOCK |", line)
+        self.assertIn("**`robots.txt` fetch failure**", text)
+        self.assertIn("**`/llms.txt` fetch failure**", text)
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "README.md"
+            self.bench._write_readme(out, payload)
+            self.assertEqual(out.read_text(encoding="utf-8"), text)
+
+    def test_robots_failure_preserves_llms_and_page_status(self):
+        page = "https://example.com/"
+        llms = "# Example\n\n> Summary.\n\n## Docs\n\n- [Guide](https://example.com/guide): Guide.\n"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", None, "text/html"),
+            "https://example.com/robots.txt": TimeoutError("robots slow"),
+            "https://example.com/llms.txt": (200, llms, None, "text/plain"),
+        }
+        with mock.patch.object(self.bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = self.bench.audit_target("r", "Robots", page, use_system_proxy=True)
+        self.assertEqual((row["http_status"], row["html_verdict"]), (200, "server_rendered"))
+        self.assertEqual(row["robots_policy"], "error")
+        self.assertIsNone(row["oai_searchbot"])
+        self.assertEqual((row["llms_http_status"], row["llms_valid"]), (200, True))
+        self.assertIn("robots slow", row["error"])
+
+    def test_normalize_robots_notes_for_missing_wildcard_group(self):
+        bench = self.bench
+        clr_note = "No AI-crawler-specific groups found; every bot falls back to the '*' group."
+        new_note = "No matching robots.txt groups (no '*' wildcard group present); RFC 9309 defaults to allow all."
+        self.assertEqual((bench._CLR_WILDCARD_NOTE, bench._NO_GROUP_NOTE), (clr_note, new_note))
+        names = ("OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "GPTBot", "ClaudeBot")
+        none_groups = {k: "(none)" for k in names}
+        star_groups = {k: "*" for k in names}
+        other = "robots.txt returned HTTP 404; RFC 9309 lets crawlers treat an unavailable (4xx) robots.txt as 'allow all'."
+        self.assertEqual(bench._normalize_robots_notes([clr_note, other], none_groups), [new_note, other])
+        self.assertEqual(bench._normalize_robots_notes([clr_note], star_groups), [clr_note])
+        self.assertEqual(bench._normalize_robots_notes([clr_note], {}), [clr_note])
+        # check_llms_and_robots.py itself still emits its original note.
+        self.assertIn(clr_note, bench.clr.audit_robots("User-agent: Googlebot\nDisallow: /x\n")["notes"])
+        page = "https://example.com/"
+        table = {
+            page: (200, "<main>" + "word " * 200 + "</main>", None, "text/html"),
+            "https://example.com/robots.txt": (404, "", None, None),
+            "https://example.com/llms.txt": (404, "", None, None),
+        }
+        with mock.patch.object(bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+            row = bench.audit_target("e", "Example", page, use_system_proxy=True)
+        self.assertEqual(set(row["crawler_groups"].values()), {"(none)"})
+        self.assertIn(new_note, row["robots_notes"])
+        self.assertNotIn(clr_note, row["robots_notes"])
+        none_slugs = []
+        for rec in self.payload["results"]:
+            if set(rec["crawler_groups"].values()) == {"(none)"}:
+                none_slugs.append(rec["slug"])
+                self.assertIn(new_note, rec["robots_notes"], rec["slug"])
+                self.assertNotIn(clr_note, rec["robots_notes"], rec["slug"])
+            else:
+                self.assertNotIn(new_note, rec["robots_notes"], rec["slug"])
+        self.assertEqual(none_slugs, ["nextjs", "vite", "docusaurus", "tailwindcss"])
+
+    def test_committed_readme_matches_write_readme_byte_for_byte(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "README.md"
+            self.bench._write_readme(out, self.payload)
+            regen = out.read_bytes()
+        self.assertEqual(regen, (BENCH_DIR / "README.md").read_bytes())
+        self.assertNotIn(b"HTTP None", regen)
+
+    def test_use_system_proxy_preflight_exits_2_without_touching_files(self):
+        bench = self.bench
+        with tempfile.TemporaryDirectory() as td:
+            paths = [Path(td) / name for name in ("snap.json", "snap.csv", "README.md")]
+            for p in paths:
+                p.write_text("sentinel\n", encoding="utf-8")
+            argv = ["--use-system-proxy", "--json-out", str(paths[0]), "--csv-out", str(paths[1]),
+                    "--readme-out", str(paths[2])]
+            for proxies in ({}, {"https": "socks5://127.0.0.1:1080"}, {"http": "https://127.0.0.1:7890"}):
+                audit = mock.MagicMock(side_effect=AssertionError("no target may run without a proxy"))
+                err, out = io.StringIO(), io.StringIO()
+                with self.subTest(proxies=proxies), self._proxy_env(proxies), \
+                        mock.patch.object(bench, "audit_target", audit), \
+                        redirect_stderr(err), redirect_stdout(out):
+                    self.assertEqual(bench.main(argv), 2)
+                    with self.assertRaises(bench.ProxyPreflightError):
+                        bench.run_benchmark(json_out=paths[0], csv_out=paths[1], readme_out=paths[2],
+                                            use_system_proxy=True)
+                audit.assert_not_called()
+                self.assertIn("--use-system-proxy requires an explicit OS HTTP proxy", err.getvalue())
+                self.assertEqual(out.getvalue(), "")
+                for p in paths:
+                    self.assertEqual(p.read_text(encoding="utf-8"), "sentinel\n", p.name)
+            base = dict(self.payload["results"][0])
+
+            def fake_audit(slug, name, url, use_system_proxy=False):
+                self.assertTrue(use_system_proxy)
+                return dict(base, slug=slug, name=name, url=url, final_url=url)
+
+            with self._proxy_env({}), mock.patch.object(bench, "audit_target", side_effect=fake_audit):
+                payload = bench.run_benchmark(json_out=paths[0], csv_out=paths[1], readme_out=paths[2],
+                                              use_system_proxy=True, require_proxy=False)
+            self.assertEqual(payload["fetch_transport"], "system_proxy")
+            self.assertEqual(json.loads(paths[0].read_text(encoding="utf-8"))["summary"]["total_targets"], 12)
+
+    def test_preflight_requires_proxy_for_every_target_scheme(self):
+        bench = self.bench
+        self.assertEqual({urllib.parse.urlsplit(u).scheme for _, _, u in bench.TARGETS}, {"https"})
+        with tempfile.TemporaryDirectory() as td:
+            paths = [Path(td) / name for name in ("snap.json", "snap.csv", "README.md")]
+            for p in paths:
+                p.write_text("sentinel\n", encoding="utf-8")
+            argv = ["--use-system-proxy", "--json-out", str(paths[0]), "--csv-out", str(paths[1]),
+                    "--readme-out", str(paths[2])]
+            audit = mock.MagicMock(side_effect=AssertionError("no target may run without an https proxy"))
+            err, out = io.StringIO(), io.StringIO()
+            with self._proxy_env({"http": "http://127.0.0.1:7890"}), \
+                    mock.patch.object(bench, "audit_target", audit), \
+                    redirect_stderr(err), redirect_stdout(out):
+                self.assertFalse(bench._has_proxy_for_targets())
+                self.assertEqual(bench.main(argv), 2)
+                with self.assertRaises(bench.ProxyPreflightError):
+                    bench.run_benchmark(json_out=paths[0], csv_out=paths[1], readme_out=paths[2],
+                                        use_system_proxy=True)
+            audit.assert_not_called()
+            self.assertIn("--use-system-proxy requires an explicit OS HTTP proxy", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            for p in paths:
+                self.assertEqual(p.read_text(encoding="utf-8"), "sentinel\n", p.name)
+
+    def test_ensure_proxy_route_honours_bracketed_ipv6_no_proxy(self):
+        route = self.bench._ensure_proxy_route
+        unsafe = self.bench.clr.UnsafeURLError
+        with self._proxy_env():
+            urllib.request.proxy_bypass.side_effect = lambda host: host == "[2001:db8::1]:443"
+            with self.assertRaises(unsafe):
+                route("https", "2001:db8::1", 443)
+            seen = [c.args[0] for c in urllib.request.proxy_bypass.call_args_list]
+            self.assertIn("[2001:db8::1]:443", seen)
+            urllib.request.proxy_bypass.reset_mock()
+            self.assertEqual(route("https", "example.com", 443), self.PROXIES["https"])
+            self.assertNotIn("[example.com]:443", [c.args[0] for c in urllib.request.proxy_bypass.call_args_list])
+
+    def test_strict_rfc1123_labels_reject_underscore_and_edge_hyphens(self):
+        bench = self.bench
+        unsafe = bench.clr.UnsafeURLError
+        opener = self._must_not_open()
+        with self._proxy_env(), mock.patch.object(bench, "_open_proxy_connection", opener):
+            for bad in ("https://bad_host.example/", "https://-bad.example/", "https://bad-.example/"):
+                with self.subTest(url=bad):
+                    with self.assertRaises(unsafe):
+                        bench._canonical_request(bad)
+                    with self.assertRaises(unsafe):
+                        bench._fetch_via_proxy(bad)
+        opener.assert_not_called()
+        for bad in ("http://bad_host.example:3128", "http://-bad.example:3128", "http://bad-.example:3128"):
+            with self.subTest(proxy=bad):
+                with self.assertRaises(unsafe):
+                    bench._proxy_hostport(bad)
+        self.assertEqual(bench._canonical_request("https://good-host.example/")[3], "good-host.example")
+        self.assertEqual(bench._proxy_hostport("http://Proxy-1.Example:3128"), ("proxy-1.example", 3128))
+
+    def test_framing_validated_before_redirect_and_error_handling(self):
+        fetch_error = self.bench.clr.FetchError
+        responses = {
+            "404": b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
+            "302": (b"HTTP/1.1 302 Found\r\nLocation: https://example.com/next\r\n"
+                    b"Content-Length: 0\r\nContent-Length: 7\r\n\r\n"),
+        }
+        for label, raw in responses.items():
+            opened = []
+
+            def fake_open(scheme, host, port, *_rest, raw=raw):
+                opened.append((scheme, host, port))
+                return FakeSocket(raw)
+
+            with self.subTest(status=label), self._proxy_env(), \
+                    mock.patch.object(self.bench, "_open_proxy_connection", side_effect=fake_open):
+                with self.assertRaises(fetch_error):
+                    self.bench._fetch_via_proxy("https://example.com/robots.txt", force_utf8=True)
+            self.assertEqual(opened, [("https", "example.com", 443)], "no redirect may be followed")
+        both_404 = _FakeProxyResponse(404, b"", [("Transfer-Encoding", "chunked"), ("Content-Length", "5")],
+                                      chunked=True)
+        with self.assertRaises(fetch_error) as ctx:
+            self.bench._read_bounded_response(both_404, "https://example.com/robots.txt", True)
+        self.assertIn("both Transfer-Encoding and Content-Length", str(ctx.exception))
+        plain_404 = _FakeProxyResponse(404, b"", {"Content-Type": "text/html"})
+        self.assertEqual(self.bench._read_bounded_response(plain_404, "https://example.com/", False),
+                         (404, "", "text/html"))
+
+    def test_hop_none_note_normalized_per_hop_before_combine(self):
+        bench = self.bench
+        star = "User-agent: *\nAllow: /\n"
+        none = "User-agent: Googlebot\nDisallow: /x\n"
+        none_report = bench.clr._robots_report_for_status(200, none, "/final", "https://docs.example.org/robots.txt")
+        self.assertIn(bench._CLR_WILDCARD_NOTE, none_report["notes"])
+        fixed = bench._normalize_hop_robots_report(none_report)
+        self.assertIn(bench._NO_GROUP_NOTE, fixed["notes"])
+        self.assertNotIn(bench._CLR_WILDCARD_NOTE, fixed["notes"])
+        self.assertIn(bench._CLR_WILDCARD_NOTE, none_report["notes"], "input report is not mutated")
+        star_report = bench.clr._robots_report_for_status(200, star, "/start", "https://example.com/robots.txt")
+        self.assertIs(bench._normalize_hop_robots_report(star_report), star_report)
+
+        page, final = "https://example.com/start", "https://docs.example.org/final"
+        for first_robots, second_robots in ((star, none), (none, star)):
+            table = {
+                page: (200, "<main>" + "word " * 200 + "</main>", [page, final], "text/html"),
+                "https://example.com/robots.txt": (200, first_robots, None, "text/plain"),
+                "https://docs.example.org/robots.txt": (200, second_robots, None, "text/plain"),
+                "https://example.com/llms.txt": (404, "", None, None),
+            }
+            with self.subTest(hop1=first_robots), \
+                    mock.patch.object(bench, "_fetch_via_proxy", side_effect=self._fake_fetch(table, [])):
+                row = bench.audit_target("r", "Redirect", page, use_system_proxy=True)
+                # The '*' hop keeps its accurate fallback note; the "(none)" hop gets the no-group note.
+                self.assertIn(bench._CLR_WILDCARD_NOTE, row["robots_notes"])
+                self.assertIn(bench._NO_GROUP_NOTE, row["robots_notes"])
+
+    def test_canonical_request_rejects_bracketed_non_ipv6_and_double_trailing_dots(self):
+        bench = self.bench
+        for bad in (
+            "https://[v1.example]/",
+            "https://example.com../",
+            "https://8.8.8.8./",
+            "https://8.8.8.8\u3002/",
+            "https://.example.com/",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(bench.clr.UnsafeURLError):
+                bench._canonical_request(bad)
+        for good in ("https://[2606:4700::1111]/", "https://example.com./"):
+            with self.subTest(good=good):
+                cleaned, _req, _scheme, host, _port, _target = bench._canonical_request(good)
+                self.assertEqual(cleaned, good)
+                self.assertTrue(host)
+
+    def test_ensure_proxy_route_honours_windows_registry_port_override(self):
+        bench = self.bench
+        override = (
+            "localhost;example.com:8443;*.corp.example:8443;"
+            "[2001:db8::1]:443;http=onlyhttp.example:443"
+        )
+        with (
+            mock.patch.object(
+                bench.urllib.request,
+                "getproxies",
+                return_value={"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"},
+            ),
+            mock.patch.object(bench.urllib.request, "getproxies_environment", return_value={}),
+            mock.patch.object(bench.urllib.request, "proxy_bypass", return_value=False),
+            mock.patch.object(bench, "_read_winreg_proxy_override", return_value=override),
+        ):
+            for scheme, host, port in (
+                ("https", "example.com", 8443),
+                ("https", "api.corp.example", 8443),
+                ("https", "2001:db8::1", 443),
+                ("http", "onlyhttp.example", 443),
+            ):
+                with self.subTest(blocked=(scheme, host, port)), self.assertRaises(bench.clr.UnsafeURLError):
+                    bench._ensure_proxy_route(scheme, host, port)
+            for scheme, host, port in (
+                ("https", "example.com", 443),
+                ("https", "2001:db8::1", 8443),
+                ("https", "onlyhttp.example", 443),
+            ):
+                with self.subTest(allowed=(scheme, host, port)):
+                    self.assertEqual(bench._ensure_proxy_route(scheme, host, port), "http://127.0.0.1:7897")
 
 
 if __name__ == "__main__":
